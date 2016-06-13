@@ -17,25 +17,36 @@
 package com.sirkitboard.gface;
 
 import android.content.BroadcastReceiver;
+import android.content.ContentUris;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.res.Resources;
+import android.database.Cursor;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.Typeface;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
+import android.net.Uri;
+import android.os.AsyncTask;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
+import android.support.wearable.provider.WearableCalendarContract;
 import android.support.wearable.watchface.CanvasWatchFaceService;
 import android.support.wearable.watchface.WatchFaceStyle;
+import android.text.format.DateUtils;
 import android.text.format.Time;
+import android.util.Log;
 import android.view.SurfaceHolder;
 import android.view.WindowInsets;
 
 import java.lang.ref.WeakReference;
+import java.util.Calendar;
 import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 
@@ -47,84 +58,173 @@ public class GFace extends CanvasWatchFaceService {
     private static final Typeface NORMAL_TYPEFACE =
             Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL);
 
-    /**
-     * Update rate in milliseconds for interactive mode. We update once a second since seconds are
-     * displayed in interactive mode.
-     */
-    private static final long INTERACTIVE_UPDATE_RATE_MS = TimeUnit.SECONDS.toMillis(1);
-
-    /**
-     * Handler message id for updating the time periodically in interactive mode.
-     */
-    private static final int MSG_UPDATE_TIME = 0;
-
     @Override
     public Engine onCreateEngine() {
+        /* provide your watch face implementation */
         return new Engine();
     }
 
+    /* implement service callback methods */
     private class Engine extends CanvasWatchFaceService.Engine {
-        final Handler mUpdateTimeHandler = new EngineHandler(this);
+        static final int MSG_UPDATE_TIME = 0;
+        static final int INTERACTIVE_UPDATE_RATE_MS = 1000;
+        // Constant to help calculate clock hand rotations
+        final float TWO_PI = (float) Math.PI * 2f;
+        final float NOTCH_INCREMENT_RAD = (float) TWO_PI / 12;
+
+        Calendar mCalendar;
+
+        // device features
+        boolean mLowBitAmbient;
+        boolean mRegisteredTimeZoneReceiver;
+
+        // graphic objects
+        Bitmap mBackgroundBitmap;
+        Bitmap mBackgroundScaledBitmap;
+
+        Paint mHourPointPaint;
+        Paint mNotchPaint;
+
+        final Handler mUpdateTimeHandler = new Handler() {
+            @Override
+            public void handleMessage(Message message) {
+                switch (message.what) {
+                    case MSG_UPDATE_TIME:
+                        invalidate();
+                        if (shouldTimerBeRunning()) {
+                            long timeMs = System.currentTimeMillis();
+                            long delayMs = INTERACTIVE_UPDATE_RATE_MS
+                                    - (timeMs % INTERACTIVE_UPDATE_RATE_MS);
+                            mUpdateTimeHandler
+                                    .sendEmptyMessageDelayed(MSG_UPDATE_TIME, delayMs);
+                        }
+                        break;
+                }
+            }
+        };
 
         final BroadcastReceiver mTimeZoneReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
-                mTime.clear(intent.getStringExtra("time-zone"));
-                mTime.setToNow();
+                mCalendar.setTimeZone(TimeZone.getDefault());
+                invalidate();
             }
         };
-        boolean mRegisteredTimeZoneReceiver = false;
-
-        Paint mBackgroundPaint;
-        Paint mTextPaint;
-
-        boolean mAmbient;
-        Time mTime;
-        int mTapCount;
-
-        float mXOffset;
-        float mYOffset;
-
-        /**
-         * Whether the display supports fewer bits for each color in ambient mode. When true, we
-         * disable anti-aliasing in ambient mode.
-         */
-        boolean mLowBitAmbient;
 
         @Override
         public void onCreate(SurfaceHolder holder) {
             super.onCreate(holder);
 
+            // configure the system UI (see next section)
             setWatchFaceStyle(new WatchFaceStyle.Builder(GFace.this)
-                    .setCardPeekMode(WatchFaceStyle.PEEK_MODE_VARIABLE)
-                    .setBackgroundVisibility(WatchFaceStyle.BACKGROUND_VISIBILITY_INTERRUPTIVE)
+                    .setCardPeekMode(WatchFaceStyle.PEEK_MODE_SHORT)
+                    .setBackgroundVisibility(WatchFaceStyle
+                            .BACKGROUND_VISIBILITY_INTERRUPTIVE)
                     .setShowSystemUiTime(false)
-                    .setAcceptsTapEvents(true)
                     .build());
+
+            // load the background image
             Resources resources = GFace.this.getResources();
-            mYOffset = resources.getDimension(R.dimen.digital_y_offset);
+            Drawable backgroundDrawable = resources.getDrawable(R.drawable.background_simple, null);
+            mBackgroundBitmap = ((BitmapDrawable) backgroundDrawable).getBitmap();
+            Log.e("com.sirkit.gface", mBackgroundBitmap.toString());
 
-            mBackgroundPaint = new Paint();
-            mBackgroundPaint.setColor(resources.getColor(R.color.background));
+            mNotchPaint = new Paint();
+            mNotchPaint.setARGB(255, 200, 200, 200);
+            mNotchPaint.setStrokeWidth(2.0f);
+            mNotchPaint.setAntiAlias(true);
+            mNotchPaint.setStrokeCap(Paint.Cap.ROUND);
 
-            mTextPaint = new Paint();
-            mTextPaint = createTextPaint(resources.getColor(R.color.digital_text));
+            mHourPointPaint = new Paint();
+            mHourPointPaint.setARGB(255, 200, 200, 200);
+            mHourPointPaint.setStrokeWidth(12.0f);
+            mHourPointPaint.setAntiAlias(true);
+            mHourPointPaint.setStrokeCap(Paint.Cap.ROUND);
 
-            mTime = new Time();
+            // allocate a Calendar to calculate local time using the UTC time and time zone
+            mCalendar = Calendar.getInstance();
         }
 
         @Override
-        public void onDestroy() {
-            mUpdateTimeHandler.removeMessages(MSG_UPDATE_TIME);
-            super.onDestroy();
+        public void onPropertiesChanged(Bundle properties) {
+            super.onPropertiesChanged(properties);
+            mLowBitAmbient = properties.getBoolean(PROPERTY_LOW_BIT_AMBIENT, false);
+//            mBurnInProtection = properties.getBoolean(PROPERTY_BURN_IN_PROTECTION,
+//                    false);
         }
 
-        private Paint createTextPaint(int textColor) {
-            Paint paint = new Paint();
-            paint.setColor(textColor);
-            paint.setTypeface(NORMAL_TYPEFACE);
-            paint.setAntiAlias(true);
-            return paint;
+        @Override
+        public void onTimeTick() {
+            super.onTimeTick();
+            invalidate();
+        }
+
+        @Override
+        public void onAmbientModeChanged(boolean inAmbientMode) {
+            super.onAmbientModeChanged(inAmbientMode);
+
+            if (mLowBitAmbient) {
+                boolean antiAlias = !inAmbientMode;
+                mNotchPaint.setAntiAlias(true);
+            }
+            invalidate();
+            updateTimer();
+
+        }
+
+        @Override
+        public void onDraw(Canvas canvas, Rect bounds) {
+            // Update the time
+            mCalendar.setTimeInMillis(System.currentTimeMillis());
+
+            int width = bounds.width();
+            int height = bounds.height();
+
+            canvas.drawBitmap(mBackgroundScaledBitmap, 0, 0, null);
+
+            // Find the center. Ignore the window insets so that, on round watches
+            // with a "chin", the watch face is centered on the entire screen, not
+            // just the usable portion.
+            float centerX = width / 2f;
+            float centerY = height / 2f;
+
+            // Compute rotations and lengths for the clock hands.
+            float seconds = mCalendar.get(Calendar.SECOND) +
+                    mCalendar.get(Calendar.MILLISECOND) / 1000f;
+            float secRot = seconds / 60f * TWO_PI;
+            float minutes = mCalendar.get(Calendar.MINUTE) + seconds / 60f;
+            float minRot = minutes / 60f * TWO_PI;
+            float hours = mCalendar.get(Calendar.HOUR) + minutes / 60f;
+            float hrRot = hours / 12f * TWO_PI;
+
+            float notchInnerRadius = centerX - 20;
+//            float hrLength = centerX - 20;
+
+            // Only draw the second hand in interactive mode.
+            if (!isInAmbientMode()) {
+                float notchRot = 0;
+                float notchXStart, notchXEnd, notchYStart, notchYEnd;
+                for(int notchCount = 0; notchCount < 12; notchCount++) {
+                    notchXStart = (float) Math.sin(notchRot) * notchInnerRadius;
+                    notchXEnd = (float) Math.sin(notchRot) * (centerX);
+
+                    notchYStart = (float) -Math.cos(notchRot) * notchInnerRadius;
+                    notchYEnd = (float) -Math.cos(notchRot) * (centerY);
+
+                    canvas.drawLine(centerX + notchXStart, centerY + notchYStart, centerX + notchXEnd, centerY + notchYEnd, mNotchPaint);
+
+//                    Log.d("Increment", String.format("Value : %f",  NOTCH_INCREMENT_RAD));
+//                    Log.d("Notch Values", String.format("rot: %f xs:%f xe:%f ys:%f ye%f",  notchRot, notchXStart, notchXEnd, notchYStart, notchYEnd));
+
+                    notchRot += NOTCH_INCREMENT_RAD;
+
+                }
+            }
+
+            float timeX = (float) Math.sin(hrRot) * notchInnerRadius;
+            float timeY = (float) -Math.cos(hrRot) * notchInnerRadius;
+
+            canvas.drawPoint(centerX + timeX, centerY + timeY, mHourPointPaint );
         }
 
         @Override
@@ -135,14 +235,13 @@ public class GFace extends CanvasWatchFaceService {
                 registerReceiver();
 
                 // Update time zone in case it changed while we weren't visible.
-                mTime.clear(TimeZone.getDefault().getID());
-                mTime.setToNow();
+                mCalendar.setTimeZone(TimeZone.getDefault());
             } else {
                 unregisterReceiver();
             }
 
-            // Whether the timer should be running depends on whether we're visible (as well as
-            // whether we're in ambient mode), so we may need to start or stop the timer.
+            // Whether the timer should be running depends on whether we're visible and
+            // whether we're in ambient mode, so we may need to start or stop the timer
             updateTimer();
         }
 
@@ -163,94 +262,6 @@ public class GFace extends CanvasWatchFaceService {
             GFace.this.unregisterReceiver(mTimeZoneReceiver);
         }
 
-        @Override
-        public void onApplyWindowInsets(WindowInsets insets) {
-            super.onApplyWindowInsets(insets);
-
-            // Load resources that have alternate values for round watches.
-            Resources resources = GFace.this.getResources();
-            boolean isRound = insets.isRound();
-            mXOffset = resources.getDimension(isRound
-                    ? R.dimen.digital_x_offset_round : R.dimen.digital_x_offset);
-            float textSize = resources.getDimension(isRound
-                    ? R.dimen.digital_text_size_round : R.dimen.digital_text_size);
-
-            mTextPaint.setTextSize(textSize);
-        }
-
-        @Override
-        public void onPropertiesChanged(Bundle properties) {
-            super.onPropertiesChanged(properties);
-            mLowBitAmbient = properties.getBoolean(PROPERTY_LOW_BIT_AMBIENT, false);
-        }
-
-        @Override
-        public void onTimeTick() {
-            super.onTimeTick();
-            invalidate();
-        }
-
-        @Override
-        public void onAmbientModeChanged(boolean inAmbientMode) {
-            super.onAmbientModeChanged(inAmbientMode);
-            if (mAmbient != inAmbientMode) {
-                mAmbient = inAmbientMode;
-                if (mLowBitAmbient) {
-                    mTextPaint.setAntiAlias(!inAmbientMode);
-                }
-                invalidate();
-            }
-
-            // Whether the timer should be running depends on whether we're visible (as well as
-            // whether we're in ambient mode), so we may need to start or stop the timer.
-            updateTimer();
-        }
-
-        /**
-         * Captures tap event (and tap type) and toggles the background color if the user finishes
-         * a tap.
-         */
-        @Override
-        public void onTapCommand(int tapType, int x, int y, long eventTime) {
-            Resources resources = GFace.this.getResources();
-            switch (tapType) {
-                case TAP_TYPE_TOUCH:
-                    // The user has started touching the screen.
-                    break;
-                case TAP_TYPE_TOUCH_CANCEL:
-                    // The user has started a different gesture or otherwise cancelled the tap.
-                    break;
-                case TAP_TYPE_TAP:
-                    // The user has completed the tap gesture.
-                    mTapCount++;
-                    mBackgroundPaint.setColor(resources.getColor(mTapCount % 2 == 0 ?
-                            R.color.background : R.color.background2));
-                    break;
-            }
-            invalidate();
-        }
-
-        @Override
-        public void onDraw(Canvas canvas, Rect bounds) {
-            // Draw the background.
-            if (isInAmbientMode()) {
-                canvas.drawColor(Color.BLACK);
-            } else {
-                canvas.drawRect(0, 0, bounds.width(), bounds.height(), mBackgroundPaint);
-            }
-
-            // Draw H:MM in ambient mode or H:MM:SS in interactive mode.
-            mTime.setToNow();
-            String text = mAmbient
-                    ? String.format("%d:%02d", mTime.hour, mTime.minute)
-                    : String.format("%d:%02d:%02d", mTime.hour, mTime.minute, mTime.second);
-            canvas.drawText(text, mXOffset, mYOffset, mTextPaint);
-        }
-
-        /**
-         * Starts the {@link #mUpdateTimeHandler} timer if it should be running and isn't currently
-         * or stops it if it shouldn't be running but currently is.
-         */
         private void updateTimer() {
             mUpdateTimeHandler.removeMessages(MSG_UPDATE_TIME);
             if (shouldTimerBeRunning()) {
@@ -258,45 +269,46 @@ public class GFace extends CanvasWatchFaceService {
             }
         }
 
-        /**
-         * Returns whether the {@link #mUpdateTimeHandler} timer should be running. The timer should
-         * only run when we're visible and in interactive mode.
-         */
         private boolean shouldTimerBeRunning() {
             return isVisible() && !isInAmbientMode();
         }
 
-        /**
-         * Handle updating the time periodically in interactive mode.
-         */
-        private void handleUpdateTimeMessage() {
-            invalidate();
-            if (shouldTimerBeRunning()) {
-                long timeMs = System.currentTimeMillis();
-                long delayMs = INTERACTIVE_UPDATE_RATE_MS
-                        - (timeMs % INTERACTIVE_UPDATE_RATE_MS);
-                mUpdateTimeHandler.sendEmptyMessageDelayed(MSG_UPDATE_TIME, delayMs);
-            }
-        }
-    }
-
-    private static class EngineHandler extends Handler {
-        private final WeakReference<GFace.Engine> mWeakReference;
-
-        public EngineHandler(GFace.Engine reference) {
-            mWeakReference = new WeakReference<>(reference);
-        }
-
         @Override
-        public void handleMessage(Message msg) {
-            GFace.Engine engine = mWeakReference.get();
-            if (engine != null) {
-                switch (msg.what) {
-                    case MSG_UPDATE_TIME:
-                        engine.handleUpdateTimeMessage();
-                        break;
-                }
+        public void onSurfaceChanged(
+                SurfaceHolder holder, int format, int width, int height) {
+            if (mBackgroundScaledBitmap == null
+                    || mBackgroundScaledBitmap.getWidth() != width
+                    || mBackgroundScaledBitmap.getHeight() != height) {
+                mBackgroundScaledBitmap = Bitmap.createScaledBitmap(mBackgroundBitmap,
+                        width, height, true /* filter */);
             }
+            super.onSurfaceChanged(holder, format, width, height);
         }
+
+//        private class LoadMeetingsTask extends AsyncTask<Void, Void, Integer> {
+//            @Override
+//            protected Integer doInBackground(Void... voids) {
+//                long begin = System.currentTimeMillis();
+//                Uri.Builder builder =
+//                        WearableCalendarContract.Instances.CONTENT_URI.buildUpon();
+//                ContentUris.appendId(builder, begin);
+//                ContentUris.appendId(builder, begin + DateUtils.DAY_IN_MILLIS);
+//                final Cursor cursor = getContentResolver() .query(builder.build(),
+//                        null, null, null, null);
+//                int numMeetings = cursor.getCount();
+//                Log.d("", cursor.getColumnNames().toString());
+////                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+////                    Log.v(TAG, "Num meetings: " + numMeetings);
+////                }
+//                return numMeetings;
+//            }
+//
+//            @Override
+//            protected void onPostExecute(Integer result) {
+//        /* get the number of meetings and set the next timer tick */
+//                onMeetingsLoaded(result);
+//            }
+//        }
+
     }
 }
